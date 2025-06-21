@@ -1,0 +1,13 @@
+altair
+pandas
+streamlit
+numpy
+matplotlib
+tensorflow
+joblib
+scikit-learn
+pyarrow
+datasets
+huggingface_hub
+torch
+transformers
