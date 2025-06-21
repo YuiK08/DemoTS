@@ -8,7 +8,9 @@ import os
 import logging
 import joblib
 from sklearn.preprocessing import StandardScaler
-from tensorflow.keras.models import load_model
+from datasets import load_dataset
+import tempfile
+
 # === Logging ===
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -28,7 +30,8 @@ st.markdown("""
 
 # === Title ===
 st.title("🔌 Dự báo Siêu Chi Tiết Nhu cầu Điện Năng")
-st.markdown("64TTNT2")
+st.markdown("64TTNT2 - Demo trên Hugging Face Spaces")
+st.write("Current date and time: 10:53 PM +07, Saturday, June 21, 2025")
 
 # === Sidebar: chọn model & thời gian ===
 with st.sidebar:
@@ -37,66 +40,66 @@ with st.sidebar:
     model_options = {
         "LSTM": "lstm_full_model.h5",
         "GRU": "gru_full_model.h5",
-        "Informer": "informer_full_model"  # Đường dẫn đến thư mục chứa .pb
+        "Informer": "informer_full_model"
     }
     selected_model_name = st.selectbox("🔍 Chọn mô hình", list(model_options.keys()))
     model_path = model_options[selected_model_name]
 
-    file_path = "datathugon.csv"
     default_start = pd.to_datetime("2020-01-01")
     default_end = pd.to_datetime("2020-12-31")
     date_range = st.date_input("📅 Chọn khoảng thời gian dự báo", [default_start, default_end])
     start_date, end_date = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
 
-# === Load dữ liệu từ CSV theo chunk ===
+# === Load toàn bộ dữ liệu từ Hugging Face dataset Yu08/TS ===
 @st.cache_data(show_spinner="🔄 Đang tải dữ liệu...")
-def load_data_chunked(file_path, forecast_start, forecast_end):
-    dtypes = {
-        "Electricity_Consumed": "float32",
-        "Temperature": "float32",
-        "Humidity": "float32",
-        "Wind_Speed": "float32",
-        "Avg_Past_Consumption": "float32"
-    }
-    parse_dates = ["Timestamp"]
-    usecols = list(dtypes.keys()) + ["Timestamp"]
-    historical_start = pd.to_datetime("2000-01-01")
-    historical_end = pd.to_datetime("2025-01-01")
-    chunks = []
-
+def load_hf_data():
     try:
-        logger.info(f"Đang đọc file: {file_path}")
-        if not os.path.exists(file_path):
-            st.error(f"Tệp dữ liệu {file_path} không tồn tại!")
-            st.stop()
-        reader = pd.read_csv(file_path, dtype=dtypes, parse_dates=parse_dates,
-                             usecols=usecols, chunksize=100_000,
-                             on_bad_lines='skip', low_memory=False)
-        for chunk in reader:
-            mask = (chunk["Timestamp"] >= historical_start - timedelta(days=2)) & \
-                   (chunk["Timestamp"] <= historical_end)
-            chunk = chunk[mask]
-            if not chunk.empty:
-                chunk.set_index("Timestamp", inplace=True)
-                numeric_cols = chunk.select_dtypes(include=['number']).columns
-                chunk = chunk[numeric_cols].resample("30min").mean().dropna()
-                chunks.append(chunk)
-        if chunks:
-            df = pd.concat(chunks).groupby(level=0).mean().asfreq("30min").dropna()
-            logger.info(f"Đã tải thành công dữ liệu với {len(df)} dòng.")
-            return df
-        else:
-            logger.warning("Không có dữ liệu trong khoảng thời gian 2000-2018.")
+        cache_dir = os.path.join(tempfile.gettempdir(), "huggingface_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        os.environ["HF_HOME"] = cache_dir
+        os.environ["XDG_CACHE_HOME"] = cache_dir
+        
+        # Tải toàn bộ dataset Yu08/TS, kết hợp tất cả splits nếu cần
+        dataset = load_dataset("Yu08/TS")
+        df = pd.DataFrame()
+        
+        # Kết hợp dữ liệu từ các split (train, test, validation)
+        for split in dataset.keys():
+            split_df = pd.DataFrame(dataset[split])
+            df = pd.concat([df, split_df], ignore_index=True)
+        
+        required_cols = ['Timestamp [ns]', 'Electricity_Consumed', 'Temperature', 'Humidity', 'Wind_Speed', 'Avg_Past_Consumption']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            st.error(f"Thiếu cột: {missing_cols}. Các cột có sẵn: {df.columns.tolist()}")
             return pd.DataFrame()
+        
+        df = df.rename(columns={
+            'Timestamp [ns]': 'Timestamp',
+            'Electricity_Consumed': 'Electricity_Consumed',
+            'Temperature': 'Temperature',
+            'Humidity': 'Humidity',
+            'Wind_Speed': 'Wind_Speed',
+            'Avg_Past_Consumption': 'Avg_Past_Consumption'
+        })
+        df['Timestamp'] = pd.to_datetime(df['Timestamp'], unit='ns', errors='coerce')
+        for col in ['Electricity_Consumed', 'Temperature', 'Humidity', 'Wind_Speed', 'Avg_Past_Consumption']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        df = df.dropna(subset=['Timestamp', 'Electricity_Consumed'])
+        df = df.set_index('Timestamp').resample('30min').mean().interpolate(method='linear')
+        
+        return df
     except Exception as e:
         logger.error(f"Lỗi khi tải dữ liệu: {e}")
         st.error(f"⚠️ Lỗi tải dữ liệu: {e}")
         return pd.DataFrame()
 
-df = load_data_chunked(file_path, start_date, end_date)
+df = load_hf_data()
 
 if df.empty:
-    st.warning("⚠️ Không có dữ liệu trong khoảng thời gian được chọn.")
+    st.warning("⚠️ Không có dữ liệu trong dataset được chọn.")
     st.stop()
 
 latest_year = df.index.max().year
@@ -122,22 +125,20 @@ df["lag_1h"] = df["Electricity_Consumed"].shift(2)
 df["lag_24h"] = df["Electricity_Consumed"].shift(48)
 df["lag_168h"] = df["Electricity_Consumed"].shift(48*7)
 
-df.dropna(inplace=True)
-
-# === Đặc trưng đầu vào và target ===
 features_x = [
-    "Electricity_Consumed",
+    "Electricity_Consumed", "Temperature", "Humidity", "Wind_Speed", "Avg_Past_Consumption",
     "lag_1h", "lag_24h", "lag_168h",
     "hour_sin", "hour_cos",
     "dayofweek_sin", "dayofweek_cos",
     "dayofyear_sin", "dayofyear_cos",
     "is_weekend"
-]  # 11 features
+]
 target = "Electricity_Consumed"
 
-# === Load hoặc huấn luyện scaler_y (chỉ giữ scaler_y) ===
-scaler_y_path = f"{selected_model_name.lower()}_scaler_y.pkl"
+df.dropna(inplace=True)
 
+# === Load hoặc huấn luyện scaler_y ===
+scaler_y_path = f"{selected_model_name.lower()}_scaler_y.pkl"
 try:
     scaler_y = joblib.load(scaler_y_path)
     logger.info(f"Đã tải scaler_y từ {scaler_y_path}.")
@@ -151,11 +152,10 @@ except FileNotFoundError:
 
 # === Load mô hình ===
 if selected_model_name in ["LSTM", "GRU"]:
-    model = load_model(model_path)
+    model = tf.keras.models.load_model(model_path)
     logger.info(f"Đã tải mô hình {selected_model_name} từ {model_path}.")
 elif selected_model_name == "Informer":
     try:
-        # Đường dẫn đến thư mục SavedModel
         model = tf.saved_model.load(model_path)
         logger.info(f"Đã tải mô hình Informer từ {model_path}.")
     except Exception as e:
@@ -165,11 +165,10 @@ elif selected_model_name == "Informer":
 
 # === Dự báo ===
 try:
-    # Chuẩn bị dữ liệu (dùng dữ liệu thô đã chuẩn hóa)
     df_x = df[features_x].copy()
     df_y = df[[target]].copy()
-    X_raw = df_x.values  # Dữ liệu thô đã chuẩn hóa
-    y_scaled = scaler_y.transform(df_y.values)  # Chuẩn hóa target ban đầu
+    X_raw = df_x.values
+    y_scaled = scaler_y.transform(df_y.values)
 
     seq_length = 48
     data_seq_x = np.array([X_raw[i:i+seq_length] for i in range(len(X_raw) - seq_length)])
@@ -178,48 +177,37 @@ try:
     logger.info(f"Shape of data_seq_x: {data_seq_x.shape}")
     logger.info(f"Shape of data_seq_y: {data_seq_y.shape}")
 
-    # Tính time_idx trước khi dự đoán
     time_idx = df_x.index[seq_length:seq_length + len(data_seq_x)]
 
     if selected_model_name in ["LSTM", "GRU"]:
         n_inputs = len(model.inputs)
         logger.info(f"Số đầu vào mong đợi bởi mô hình: {n_inputs}")
-
-        if n_inputs == 2:  # Encoder-Decoder (GRU)
+        if n_inputs == 2:
             decoder_input = np.zeros((data_seq_x.shape[0], 24, 1), dtype=np.float32)
             y_pred_scaled = model.predict([data_seq_x, decoder_input], batch_size=32)
-        elif n_inputs == 1:  # Chỉ encoder (LSTM)
+        elif n_inputs == 1:
             y_pred_scaled = model.predict(data_seq_x, batch_size=32)
         else:
             raise ValueError(f"Mô hình yêu cầu {n_inputs} đầu vào, không được hỗ trợ.")
     elif selected_model_name == "Informer":
-        # Chuyển dữ liệu sang định dạng TensorFlow
         data_seq_x_tensor = tf.convert_to_tensor(data_seq_x, dtype=tf.float32)
-        # Gọi mô hình SavedModel (cần kiểm tra signature_def)
-        try:
-            # Kiểm tra signature có sẵn
-            signatures = list(model.signatures.keys())
-            logger.info(f"Signatures available: {signatures}")
-            if "serving_default" in signatures:
-                y_pred_scaled = model.signatures["serving_default"](data_seq_x_tensor)
-                y_pred_scaled = y_pred_scaled['output_0']  # Điều chỉnh tên output
-            else:
-                raise ValueError("Không tìm thấy signature 'serving_default'")
-        except Exception as e:
-            logger.error(f"Lỗi khi gọi mô hình Informer: {e}")
-            st.error(f"⚠️ Lỗi gọi mô hình Informer: {e}")
-            st.stop()
-        y_pred_scaled = y_pred_scaled.numpy()  # Chuyển về numpy array
+        signatures = list(model.signatures.keys())
+        logger.info(f"Signatures available: {signatures}")
+        if "serving_default" in signatures:
+            y_pred_scaled = model.signatures["serving_default"](data_seq_x_tensor)
+            y_pred_scaled = y_pred_scaled['output_0']
+        else:
+            raise ValueError("Không tìm thấy signature 'serving_default'")
+        y_pred_scaled = y_pred_scaled.numpy()
 
     logger.info(f"Shape of y_pred_scaled: {y_pred_scaled.shape}")
 
-    # Chuyển ngược về giá trị gốc (chỉ áp dụng cho đầu ra 2D)
     if y_pred_scaled.ndim == 3:
         y_pred_scaled_2d = y_pred_scaled.reshape(-1, y_pred_scaled.shape[-1])
     else:
         y_pred_scaled_2d = y_pred_scaled
     y_pred = scaler_y.inverse_transform(y_pred_scaled_2d)
-    y_pred = y_pred.flatten()[:len(time_idx)]  # Cắt về đúng số mẫu
+    y_pred = y_pred.flatten()[:len(time_idx)]
 
     df_result = pd.DataFrame({"Timestamp": time_idx, "Dự báo": y_pred}).set_index("Timestamp")
     df_result = df_result[(df_result.index >= start_date) & (df_result.index <= end_date)]
