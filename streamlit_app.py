@@ -1,246 +1,397 @@
+import os
+import warnings
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from datetime import timedelta
+import time
+from datetime import datetime, timedelta
+import plotly.graph_objects as go
 import tensorflow as tf
-import os
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Input, LSTM, GRU, Dense
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 import logging
-import joblib
-from sklearn.preprocessing import StandardScaler
-from datasets import load_dataset
-import tempfile
 
-# === Logging ===
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Ép TensorFlow dùng CPU và giảm logging
+tf.get_logger().setLevel('ERROR')
+tf.config.set_visible_devices([], 'GPU')
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['CUDA_VISIBLE_DEVICES'] = ''
+
+# Thiết lập logging tối thiểu
+logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# === Streamlit UI settings ===
-st.set_page_config(page_title="Dự báo Nhu cầu Điện", layout="wide")
-st.markdown("""
-    <style>
-    .main { background-color: #F9FAFC; }
-    .sidebar .sidebar-content { background-color: #F0F2F6; padding: 10px }
-    .block-container { padding-top: 1rem; padding-bottom: 1rem; }
-    .stSelectbox, .stDateInput { font-size: 16px; }
-    .stWarning { color: #FFA500; }
-    .stError { color: #FF0000; }
-    </style>
-""", unsafe_allow_html=True)
+# Thiết lập thư mục tạm
+os.environ['HOME'] = '/tmp'
+os.environ['STREAMLIT_CONFIG_DIR'] = '/tmp/streamlit_config'
+os.environ['STREAMLIT_HOME'] = '/tmp/streamlit_home'
+os.environ['MPLCONFIGDIR'] = '/tmp/matplotlib_config'
 
-# === Title ===
-st.title("🔌 Dự báo Siêu Chi Tiết Nhu cầu Điện Năng")
-st.markdown("64TTNT2 - Demo trên Hugging Face Spaces")
-st.write("Current date and time: 10:53 PM +07, Saturday, June 21, 2025")
-
-# === Sidebar: chọn model & thời gian ===
-with st.sidebar:
-    st.header("⚙️ Cấu hình")
-
-    model_options = {
-        "LSTM": "lstm_full_model.h5",
-        "GRU": "gru_full_model.h5",
-        "Informer": "informer_full_model"
-    }
-    selected_model_name = st.selectbox("🔍 Chọn mô hình", list(model_options.keys()))
-    model_path = model_options[selected_model_name]
-
-    default_start = pd.to_datetime("2020-01-01")
-    default_end = pd.to_datetime("2020-12-31")
-    date_range = st.date_input("📅 Chọn khoảng thời gian dự báo", [default_start, default_end])
-    start_date, end_date = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
-
-# === Load toàn bộ dữ liệu từ Hugging Face dataset Yu08/TS ===
-@st.cache_data(show_spinner="🔄 Đang tải dữ liệu...")
-def load_hf_data():
+# Kiểm tra và tạo thư mục cấu hình với quyền ghi
+def ensure_writable_directory(directory):
     try:
-        cache_dir = os.path.join(tempfile.gettempdir(), "huggingface_cache")
-        os.makedirs(cache_dir, exist_ok=True)
-        
-        os.environ["HF_HOME"] = cache_dir
-        os.environ["XDG_CACHE_HOME"] = cache_dir
-        
-        # Tải toàn bộ dataset Yu08/TS, kết hợp tất cả splits nếu cần
-        dataset = load_dataset("Yu08/TS")
-        df = pd.DataFrame()
-        
-        # Kết hợp dữ liệu từ các split (train, test, validation)
-        for split in dataset.keys():
-            split_df = pd.DataFrame(dataset[split])
-            df = pd.concat([df, split_df], ignore_index=True)
-        
-        required_cols = ['Timestamp [ns]', 'Electricity_Consumed', 'Temperature', 'Humidity', 'Wind_Speed', 'Avg_Past_Consumption']
-        missing_cols = [col for col in required_cols if col not in df.columns]
-        if missing_cols:
-            st.error(f"Thiếu cột: {missing_cols}. Các cột có sẵn: {df.columns.tolist()}")
-            return pd.DataFrame()
-        
-        df = df.rename(columns={
-            'Timestamp [ns]': 'Timestamp',
-            'Electricity_Consumed': 'Electricity_Consumed',
-            'Temperature': 'Temperature',
-            'Humidity': 'Humidity',
-            'Wind_Speed': 'Wind_Speed',
-            'Avg_Past_Consumption': 'Avg_Past_Consumption'
-        })
-        df['Timestamp'] = pd.to_datetime(df['Timestamp'], unit='ns', errors='coerce')
-        for col in ['Electricity_Consumed', 'Temperature', 'Humidity', 'Wind_Speed', 'Avg_Past_Consumption']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-        
-        df = df.dropna(subset=['Timestamp', 'Electricity_Consumed'])
-        df = df.set_index('Timestamp').resample('30min').mean().interpolate(method='linear')
-        
-        return df
+        if not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True)
+            os.chmod(directory, 0o777)
+        test_file = os.path.join(directory, '.test_write')
+        with open(test_file, 'w') as f:
+            f.write('test')
+        os.remove(test_file)
+        return True
     except Exception as e:
-        logger.error(f"Lỗi khi tải dữ liệu: {e}")
-        st.error(f"⚠️ Lỗi tải dữ liệu: {e}")
-        return pd.DataFrame()
+        logger.error(f"Không thể tạo hoặc ghi vào {directory}: {e}")
+        return False
 
-df = load_hf_data()
+# Tạo các thư mục cấu hình
+config_dirs = [os.environ['STREAMLIT_CONFIG_DIR'], os.environ['STREAMLIT_HOME'], os.environ['MPLCONFIGDIR']]
+for config_dir in config_dirs:
+    if not ensure_writable_directory(config_dir):
+        st.error(f"Không thể tạo thư mục {config_dir}. Falling back to /tmp.")
+        os.environ['STREAMLIT_CONFIG_DIR'] = '/tmp'
+        os.environ['STREAMLIT_HOME'] = '/tmp'
+        os.environ['MPLCONFIGDIR'] = '/tmp'
 
+# Tạo tệp cấu hình Streamlit giả
+try:
+    config_path = os.path.join(os.environ['STREAMLIT_CONFIG_DIR'], 'config.toml')
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    with open(config_path, 'w') as f:
+        f.write('[global]\ndataDir = "/tmp/streamlit_home"\n')
+except Exception as e:
+    logger.error(f"Không thể tạo config.toml: {e}")
+
+# Cấu hình trang
+st.set_page_config(page_title="Dự báo siêu chi tiết nhu cầu điện năng", page_icon="⚡", layout="wide")
+st.title("Dự báo siêu chi tiết nhu cầu điện năng")
+st.write(f"Ngày giờ hiện tại: {datetime.now().strftime('%I:%M %p %z, %A, %B %d, %Y')}")
+
+# Utility functions
+def mape(y_true, y_pred, epsilon=1e-10):
+    return np.mean(np.abs((y_true - y_pred) / np.maximum(np.abs(y_true), epsilon))) * 100
+
+def smape(y_true, y_pred):
+    return 100 * np.mean(2 * np.abs(y_pred - y_true) / (np.abs(y_true) + np.abs(y_pred) + 1e-10))
+
+def create_sequences(data, time_steps):
+    X, y = [], []
+    for i in range(len(data) - time_steps):
+        X.append(data[i:(i + time_steps)])
+        y.append(data[i + time_steps])
+    return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
+
+# Load dữ liệu từ data11.parquet (chỉ năm 2010)
+@st.cache_data(show_spinner="🔄 Đang tải dữ liệu...")
+def load_parquet_data():
+    path = "src/data11.parquet"
+    try:
+        columns = ['Electricity_Consumed', 'Temperature', 'Humidity', 'Wind_Speed', 'Avg_Past_Consumption', 'Timestamp']
+        df = pd.read_parquet(path, columns=columns, engine='fastparquet')
+        # Lọc dữ liệu chỉ cho năm 2010
+        df['Timestamp'] = pd.to_datetime(df['Timestamp'], errors='coerce')
+        df = df[(df['Timestamp'] >= '2010-01-01') & (df['Timestamp'] <= '2010-12-31')]
+        if df.empty:
+            raise ValueError("Không tìm thấy dữ liệu năm 2010 trong file data11.parquet")
+        logger.info(f"Dữ liệu năm 2010 tải thành công: {len(df)} mẫu")
+    except Exception as e:
+        logger.warning(f"Lỗi khi đọc file data11.parquet: {e}, tạo dữ liệu mẫu năm 2010...")
+        dates = pd.date_range(start="2010-01-01", end="2010-12-31", freq="30min")
+        df = pd.DataFrame(index=dates)
+        df['Electricity_Consumed'] = np.random.normal(1000, 200, len(dates))
+        df['Temperature'] = np.random.normal(25, 5, len(dates))
+        df['Humidity'] = np.random.normal(60, 10, len(dates))
+        df['Wind_Speed'] = np.random.normal(5, 2, len(dates))
+        df['Avg_Past_Consumption'] = np.random.normal(1000, 200, len(dates))
+        df['Timestamp'] = df.index
+        logger.info(f"Dữ liệu mẫu năm 2010 tạo thành công: {len(df)} mẫu")
+    
+    df = df.dropna(subset=['Timestamp']).set_index('Timestamp')
+    return df
+
+# Feature engineering
+def prepare_features(df):
+    df = df.copy()
+    df["hour"] = df.index.hour
+    df["dayofweek"] = df.index.dayofweek
+    df["dayofyear"] = df.index.dayofyear
+    df["is_weekend"] = df["dayofweek"].isin([5, 6]).astype(np.int8)
+    df[["hour_sin", "hour_cos"]] = np.column_stack([
+        np.sin(2 * np.pi * df["hour"] / 24),
+        np.cos(2 * np.pi * df["hour"] / 24)
+    ])
+    df[["dayofweek_sin", "dayofweek_cos"]] = np.column_stack([
+        np.sin(2 * np.pi * df["dayofweek"] / 7),
+        np.cos(2 * np.pi * df["dayofweek"] / 7)
+    ])
+    df[["dayofyear_sin", "dayofyear_cos"]] = np.column_stack([
+        np.sin(2 * np.pi * df["dayofyear"] / 365.25),
+        np.cos(2 * np.pi * df["dayofyear"] / 365.25)
+    ])
+    df["lag_1h"] = df["Electricity_Consumed"].shift(2)
+    df["lag_24h"] = df["Electricity_Consumed"].shift(48)
+    df["lag_168h"] = df["Electricity_Consumed"].shift(48*7)
+    df = df.dropna()
+    return df
+
+# Sidebar
+with st.sidebar:
+    st.header("Cài đặt")
+    models = ["LSTM", "GRU", "Informer"]
+    selected_model = st.selectbox("Chọn mô hình", models)
+    default_start = pd.to_datetime("2011-01-01")
+    default_end = pd.to_datetime("2011-05-04")
+    date_range = st.date_input("📅 Chọn khoảng thời gian dự báo", [default_start, default_end])
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        start_date, end_date = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
+    else:
+        st.warning("Vui lòng chọn cả ngày bắt đầu và kết thúc. Sử dụng giá trị mặc định.")
+        start_date, end_date = default_start, default_end
+    if start_date > end_date:
+        st.error("Ngày bắt đầu phải trước ngày kết thúc.")
+        st.stop()
+    if st.button("🗑️ Xóa cache"):
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        st.success("Cache đã được xóa!")
+
+# Load and prepare data
+df = load_parquet_data()
 if df.empty:
-    st.warning("⚠️ Không có dữ liệu trong dataset được chọn.")
+    st.error("Dữ liệu rỗng, vui lòng kiểm tra file data11.parquet")
     st.stop()
-
-latest_year = df.index.max().year
-if start_date.year > latest_year:
-    st.warning(f"⚠️ Dữ liệu chỉ đến năm {latest_year}. Điều chỉnh dự báo.")
-    start_date = pd.to_datetime(f"{latest_year}-01-01")
-    end_date = pd.to_datetime(f"{latest_year}-12-31")
-
-# === Tiền xử lý đặc trưng ===
-df["hour"] = df.index.hour
-df["dayofweek"] = df.index.dayofweek
-df["dayofyear"] = df.index.dayofyear
-df["is_weekend"] = df["dayofweek"].isin([5, 6]).astype(int)
-
-df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
-df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
-df["dayofweek_sin"] = np.sin(2 * np.pi * df["dayofweek"] / 7)
-df["dayofweek_cos"] = np.cos(2 * np.pi * df["dayofweek"] / 7)
-df["dayofyear_sin"] = np.sin(2 * np.pi * df["dayofyear"] / 365.25)
-df["dayofyear_cos"] = np.cos(2 * np.pi * df["dayofyear"] / 365.25)
-
-df["lag_1h"] = df["Electricity_Consumed"].shift(2)
-df["lag_24h"] = df["Electricity_Consumed"].shift(48)
-df["lag_168h"] = df["Electricity_Consumed"].shift(48*7)
-
+df = prepare_features(df)
 features_x = [
     "Electricity_Consumed", "Temperature", "Humidity", "Wind_Speed", "Avg_Past_Consumption",
-    "lag_1h", "lag_24h", "lag_168h",
-    "hour_sin", "hour_cos",
-    "dayofweek_sin", "dayofweek_cos",
-    "dayofyear_sin", "dayofyear_cos",
-    "is_weekend"
+    "lag_1h", "lag_24h", "lag_168h", "hour_sin", "hour_cos",
+    "dayofweek_sin", "dayofweek_cos", "dayofyear_sin", "dayofyear_cos", "is_weekend"
 ]
-target = "Electricity_Consumed"
 
-df.dropna(inplace=True)
+# Kiểm tra start_date
+if start_date < df.index[-1]:
+    st.warning(f"Ngày bắt đầu ({start_date}) sớm hơn thời điểm cuối dữ liệu ({df.index[-1]}). Điều chỉnh để dự báo từ {df.index[-1]}.")
+    start_date = df.index[-1] + timedelta(minutes=30)
 
-# === Load hoặc huấn luyện scaler_y ===
-scaler_y_path = f"{selected_model_name.lower()}_scaler_y.pkl"
-try:
-    scaler_y = joblib.load(scaler_y_path)
-    logger.info(f"Đã tải scaler_y từ {scaler_y_path}.")
-except FileNotFoundError:
-    logger.warning(f"Không tìm thấy scaler_y: {scaler_y_path}. Đang huấn luyện lại...")
-    st.warning("Scaler_y không tồn tại. Đang huấn luyện lại scaler_y...")
-    scaler_y = StandardScaler()
-    scaler_y.fit(df[[target]])
-    joblib.dump(scaler_y, scaler_y_path)
-    logger.info(f"Đã huấn luyện và lưu scaler_y.")
+# Hàm xây dựng mô hình
+def build_model(model_type, seq_length, n_features):
+    if model_type == "LSTM":
+        model = Sequential([
+            Input(shape=(seq_length, n_features)),
+            LSTM(16, return_sequences=False),
+            Dense(8, activation='relu'),
+            Dense(1)
+        ])
+    elif model_type == "GRU":
+        model = Sequential([
+            Input(shape=(seq_length, n_features)),
+            GRU(16, return_sequences=False),
+            Dense(8, activation='relu'),
+            Dense(1)
+        ])
+    elif model_type == "Informer":
+        model = Sequential([
+            Input(shape=(seq_length, n_features)),
+            LSTM(16, return_sequences=True),
+            LSTM(8, return_sequences=False),
+            Dense(8, activation='relu'),
+            Dense(1)
+        ])
+    model.compile(optimizer='adam', loss='mse')
+    return model
 
-# === Load mô hình ===
-if selected_model_name in ["LSTM", "GRU"]:
-    model = tf.keras.models.load_model(model_path)
-    logger.info(f"Đã tải mô hình {selected_model_name} từ {model_path}.")
-elif selected_model_name == "Informer":
+# Hàm huấn luyện và dự báo
+@st.cache_resource(show_spinner="🔄 Đang huấn luyện mô hình...")
+def train_and_forecast(_df, model_type, start_date, end_date, seq_length=48):
     try:
-        model = tf.saved_model.load(model_path)
-        logger.info(f"Đã tải mô hình Informer từ {model_path}.")
+        df_x = _df[features_x].copy()
+        scaler = MinMaxScaler()
+        scaled_data = scaler.fit_transform(df_x)
+        X, y = create_sequences(scaled_data, seq_length)
+        if len(X) < 500:
+            st.error(f"Dữ liệu không đủ để tạo sequence: {len(X)} mẫu. Cần ít nhất 500 mẫu.")
+            return None, None, None, None
+        train_size = int(len(X) * 0.8)
+        X_train, X_test = X[:train_size], X[train_size:]
+        y_train, y_test = y[:train_size], y[train_size:]
+        model = build_model(model_type, seq_length, len(features_x))
+        model.fit(X_train, y_train[:, 0], epochs=3, batch_size=256, verbose=0)
+        y_pred_scaled = model.predict(X_test, batch_size=256, verbose=0)
+        y_pred = scaler.inverse_transform(
+            np.column_stack([y_pred_scaled.flatten()] + [np.zeros((len(y_pred_scaled), len(features_x)-1))])
+        )[:, 0]
+        y_true = scaler.inverse_transform(y_test)[:, 0]
+        test_index = _df.index[train_size + seq_length:train_size + seq_length + len(y_pred)]
+        # Dự báo tương lai theo batch
+        last_sequence = scaled_data[-seq_length:].reshape(1, seq_length, len(features_x))
+        future_predictions = []
+        future_index = pd.date_range(start=_df.index[-1] + timedelta(minutes=30), end=end_date, freq='30min')
+        batch_size = 96
+        for i in range(0, len(future_index), batch_size):
+            batch_end = min(i + batch_size, len(future_index))
+            batch_predictions = []
+            current_sequence = last_sequence.copy()
+            for j in range(i, batch_end):
+                pred_scaled = model.predict(current_sequence, batch_size=1, verbose=0)
+                pred_value = scaler.inverse_transform(
+                    np.column_stack([pred_scaled.flatten()] + [np.zeros((len(pred_scaled), len(features_x)-1))])
+                )[:, 0]
+                batch_predictions.append(pred_value[0])
+                next_sequence = current_sequence[0, 1:, :].copy()
+                new_row = current_sequence[0, -1, :].copy()
+                new_row[0] = pred_scaled[0, 0]
+                future_time = future_index[j]
+                new_row[features_x.index("hour_sin")] = np.sin(2 * np.pi * future_time.hour / 24)
+                new_row[features_x.index("hour_cos")] = np.cos(2 * np.pi * future_time.hour / 24)
+                new_row[features_x.index("dayofweek_sin")] = np.sin(2 * np.pi * future_time.dayofweek / 7)
+                new_row[features_x.index("dayofweek_cos")] = np.cos(2 * np.pi * future_time.dayofweek / 7)
+                new_row[features_x.index("dayofyear_sin")] = np.sin(2 * np.pi * future_time.dayofyear / 365.25)
+                new_row[features_x.index("dayofyear_cos")] = np.cos(2 * np.pi * future_time.dayofyear / 365.25)
+                new_row[features_x.index("is_weekend")] = 1 if future_time.dayofweek in [5, 6] else 0
+                current_sequence = np.append(next_sequence, [new_row], axis=0).reshape(1, seq_length, len(features_x))
+            future_predictions.extend(batch_predictions)
+            last_sequence = current_sequence
+        tf.keras.backend.clear_session()
+        return test_index, y_true, y_pred, future_index, np.array(future_predictions)
     except Exception as e:
-        logger.error(f"Lỗi khi tải mô hình Informer: {e}")
-        st.error(f"⚠️ Lỗi tải mô hình Informer: {e}")
-        st.stop()
+        logger.error(f"Lỗi trong train_and_forecast {model_type}: {e}")
+        st.error(f"Lỗi {model_type}: {e}")
+        return None, None, None, None
 
-# === Dự báo ===
-try:
-    df_x = df[features_x].copy()
-    df_y = df[[target]].copy()
-    X_raw = df_x.values
-    y_scaled = scaler_y.transform(df_y.values)
+# Tính metrics
+def calculate_metrics(y_true, y_pred):
+    try:
+        mae = mean_absolute_error(y_true, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+        mape_val = mape(y_true, y_pred)
+        smape_val = smape(y_true, y_pred)
+        corr = np.corrcoef(y_true, y_pred)[0, 1] if len(y_true) > 1 else 0.0
+        return {
+            "MAE": round(mae, 4),
+            "RMSE": round(rmse, 4),
+            "MAPE (%)": round(mape_val, 2),
+            "sMAPE (%)": round(smape_val, 2),
+            "Correlation": round(corr, 4)
+        }
+    except:
+        return {"MAE": 0, "RMSE": 0, "MAPE (%)": 0, "sMAPE (%)": 0, "Correlation": 0}
 
-    seq_length = 48
-    data_seq_x = np.array([X_raw[i:i+seq_length] for i in range(len(X_raw) - seq_length)])
-    data_seq_y = np.array([y_scaled[i:i+seq_length] for i in range(len(y_scaled) - seq_length)])
-
-    logger.info(f"Shape of data_seq_x: {data_seq_x.shape}")
-    logger.info(f"Shape of data_seq_y: {data_seq_y.shape}")
-
-    time_idx = df_x.index[seq_length:seq_length + len(data_seq_x)]
-
-    if selected_model_name in ["LSTM", "GRU"]:
-        n_inputs = len(model.inputs)
-        logger.info(f"Số đầu vào mong đợi bởi mô hình: {n_inputs}")
-        if n_inputs == 2:
-            decoder_input = np.zeros((data_seq_x.shape[0], 24, 1), dtype=np.float32)
-            y_pred_scaled = model.predict([data_seq_x, decoder_input], batch_size=32)
-        elif n_inputs == 1:
-            y_pred_scaled = model.predict(data_seq_x, batch_size=32)
-        else:
-            raise ValueError(f"Mô hình yêu cầu {n_inputs} đầu vào, không được hỗ trợ.")
-    elif selected_model_name == "Informer":
-        data_seq_x_tensor = tf.convert_to_tensor(data_seq_x, dtype=tf.float32)
-        signatures = list(model.signatures.keys())
-        logger.info(f"Signatures available: {signatures}")
-        if "serving_default" in signatures:
-            y_pred_scaled = model.signatures["serving_default"](data_seq_x_tensor)
-            y_pred_scaled = y_pred_scaled['output_0']
-        else:
-            raise ValueError("Không tìm thấy signature 'serving_default'")
-        y_pred_scaled = y_pred_scaled.numpy()
-
-    logger.info(f"Shape of y_pred_scaled: {y_pred_scaled.shape}")
-
-    if y_pred_scaled.ndim == 3:
-        y_pred_scaled_2d = y_pred_scaled.reshape(-1, y_pred_scaled.shape[-1])
-    else:
-        y_pred_scaled_2d = y_pred_scaled
-    y_pred = scaler_y.inverse_transform(y_pred_scaled_2d)
-    y_pred = y_pred.flatten()[:len(time_idx)]
-
-    df_result = pd.DataFrame({"Timestamp": time_idx, "Dự báo": y_pred}).set_index("Timestamp")
-    df_result = df_result[(df_result.index >= start_date) & (df_result.index <= end_date)]
-
-    logger.info(f"✅ Dự báo thành công với {len(df_result)} dòng.")
-except Exception as e:
-    logger.error(f"Lỗi dự báo: {e}")
-    st.error(f"⚠️ Lỗi dự báo: {e}")
-    st.stop()
-
-# === Hiển thị kết quả ===
-st.success(f"✅ Đã dự báo thành công với mô hình {selected_model_name}")
-
-col1, col2 = st.columns([2, 1])
-with col1:
-    st.subheader("📈 Biểu đồ Dự báo")
-    df_historical = df[[target]].rename(columns={target: "Dữ liệu gốc"})
-    df_combined = pd.concat([df_historical, df_result])
-    fig, ax = plt.subplots(figsize=(12, 5))
-    df_combined.plot(ax=ax, color={"Dữ liệu gốc": "green", "Dự báo": "royalblue"}, label=["Dữ liệu gốc", "Dự báo"])
-    ax.set_ylabel("Nhu cầu điện (kWh)")
-    ax.set_xlabel("Thời gian")
-    ax.set_title(f"Dự báo nhu cầu điện ({start_date.year} - {end_date.year})")
-    ax.grid(True, linestyle='--', alpha=0.3)
-    ax.legend()
-    st.pyplot(fig)
-
-with col2:
-    st.subheader("📊 Thống kê dự báo")
-    st.dataframe(df_result.describe().T, use_container_width=True)
-
-    st.subheader("🧾 Toàn bộ dữ liệu dự báo")
-    st.dataframe(df_result, use_container_width=True)
-
-    csv = df_result.reset_index().to_csv(index=False).encode("utf-8")
-    st.download_button("📥 Tải dữ liệu dự báo", data=csv, file_name="du_bao_nhu_cau_dien.csv", mime="text/csv")
+# Main content
+min_required = 336
+if len(df) < min_required:
+    st.error(f"Cần ít nhất {min_required} mẫu dữ liệu. Hiện có: {len(df)}")
+else:
+    # Thống kê cơ bản
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Tổng mẫu", f"{len(df):,}")
+    with col2:
+        st.metric("Trung bình", f"{df['Electricity_Consumed'].mean():.3f} kWh")
+    with col3:
+        st.metric("Max", f"{df['Electricity_Consumed'].max():.3f} kWh")
+    with col4:
+        st.metric("Min", f"{df['Electricity_Consumed'].min():.3f} kWh")
+    
+    # Biểu đồ dữ liệu tiêu thụ điện (2 ngày cuối năm 2010)
+    st.subheader("Dữ liệu tiêu thụ điện năm 2010")
+    display_data = df.tail(96)  # 2 ngày cuối năm 2010
+    fig_data = go.Figure()
+    fig_data.add_trace(go.Scatter(
+        x=display_data.index, 
+        y=display_data['Electricity_Consumed'], 
+        mode='lines', 
+        name='Tiêu thụ điện'
+    ))
+    fig_data.update_layout(
+        xaxis_title="Thời gian", 
+        yaxis_title="kWh", 
+        height=400,
+        xaxis_range=[display_data.index[0], display_data.index[-1]]
+    )
+    st.plotly_chart(fig_data, use_container_width=True)
+    
+    # Dự báo
+    st.markdown("---")
+    st.subheader("Dự báo cho năm 2011")
+    if st.button("Bắt đầu dự báo", use_container_width=True):
+        with st.spinner(f"Đang dự báo với {selected_model}..."):
+            start_time = time.time()
+            test_index, y_true, y_pred, future_index, future_predictions = train_and_forecast(df, selected_model, start_date, end_date)
+            
+            if test_index is not None and future_index is not None:
+                df_result = pd.DataFrame({"Timestamp": test_index, "Dữ liệu gốc": y_true, "Dự báo": y_pred}).set_index("Timestamp")
+                df_future = pd.DataFrame({"Timestamp": future_index, "Dự báo tương lai": future_predictions}).set_index("Timestamp")
+                df_future = df_future[(df_future.index >= start_date) & (df_future.index <= end_date)]
+                
+                # Biểu đồ kết quả
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=display_data.index, y=display_data['Electricity_Consumed'],
+                    mode='lines', name='Dữ liệu năm 2010', line=dict(color='gray')
+                ))
+                fig.add_trace(go.Scatter(
+                    x=df_result.index, y=df_result['Dữ liệu gốc'],
+                    mode='lines+markers', name='Thực tế', line=dict(color='blue')
+                ))
+                colors = {"LSTM": "green", "GRU": "orange", "Informer": "purple"}
+                fig.add_trace(go.Scatter(
+                    x=df_result.index, y=df_result['Dự báo'],
+                    mode='lines+markers', name=f'Dự báo ({selected_model})',
+                    line=dict(color=colors.get(selected_model, "purple"), dash='dash')
+                ))
+                fig.add_trace(go.Scatter(
+                    x=df_future.index, y=df_future['Dự báo tương lai'],
+                    mode='lines', name='Dự báo tương lai', line=dict(color='red', dash='dot')
+                ))
+                fig.update_layout(
+                    title=f"Kết quả dự báo - {selected_model} ({start_date.strftime('%d/%m/%Y')} - {end_date.strftime('%d/%m/%Y')})",
+                    xaxis_title="Thời gian", yaxis_title="kWh",
+                    height=500, hovermode='x unified'
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Metrics
+                metrics = calculate_metrics(df_result["Dữ liệu gốc"], df_result["Dự báo"])
+                processing_time = time.time() - start_time
+                st.success(f"Hoàn thành trong {processing_time:.2f} giây")
+                
+                col1, col2, col3, col4, col5 = st.columns(5)
+                with col1:
+                    st.metric("MAE", metrics["MAE"])
+                with col2:
+                    st.metric("RMSE", metrics["RMSE"])
+                with col3:
+                    st.metric("MAPE", f"{metrics['MAPE (%)']}%")
+                with col4:
+                    st.metric("sMAPE", f"{metrics['sMAPE (%)']}%")
+                with col5:
+                    st.metric("Correlation", metrics["Correlation"])
+                
+                # Bảng kết quả
+                st.subheader("🧾 Dự báo tương lai")
+                if not df_future.empty:
+                    st.dataframe(df_future, use_container_width=True)
+                    csv_future = df_future.reset_index().to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "📥 Tải dữ liệu dự báo tương lai",
+                        csv_future,
+                        f"du_bao_tuong_lai_{selected_model}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                        "text/csv"
+                    )
+                else:
+                    st.warning("Không có dữ liệu dự báo tương lai trong khoảng thời gian đã chọn.")
+                
+                st.subheader("🧾 Dự báo tập kiểm tra")
+                if not df_result.empty:
+                    st.dataframe(df_result, use_container_width=True)
+                    csv_result = df_result.reset_index().to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "📥 Tải dữ liệu dự báo tập kiểm tra",
+                        csv_result,
+                        f"du_bao_test_{selected_model}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                        "text/csv"
+                    )
+                else:
+                    st.warning("Không có dữ liệu dự báo tập kiểm tra.")
+            else:
+                st.error("Không thể dự báo. Vui lòng kiểm tra dữ liệu.")
